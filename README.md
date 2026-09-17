@@ -16,6 +16,13 @@ ikang-formal-datamining/
 │   ├── test_export_items.py
 │   ├── test_filter_parquets_by_ids.py
 │   └── test_import_parquet_to_mysql.py
+├── sqls/
+│   ├── check_itemresult_numeric.sql
+│   ├── check_normal_values_numeric.sql
+│   ├── migrate_itemindexresultunit_to_text.sql
+│   ├── migrate_itemresult_to_double.sql
+│   ├── migrate_normal_values_to_double.sql
+│   └── migrate_lab_item_uid_to_itemname.sql
 ├── items.csv
 └── README.md
 ```
@@ -119,6 +126,96 @@ list、struct、map 等嵌套类型不会被隐式序列化，遇到时直接报
 每批数据独立提交；如果中途失败，已经提交的批次会保留，错误批次会回滚。再次
 导入前应根据实际情况删除该表、使用 `replace`，或确认不会产生重复后再使用
 `append`。
+
+## 4. 调整 `lab_item_alt` 的前半段表结构
+
+`sqls/migrate_lab_item_uid_to_itemname.sql` 将 `uid` 到 `itemname` 修改为目标
+类型，并创建 `(uid, id)` 主键以及 `hospid`、`regdate`、`usex`、
+`checkitemcode`、`itemcode` 索引。迁移时会完成以下数据规范化：
+
+- `uid`、`id` 去除首尾空白；
+- `hospid`、`regdate`、`deptid` 的空字符串改为 `NULL`；
+- 原始性别 `男` 映射为枚举值 `MAN`；
+- 原始性别 `女` 映射为枚举值 `WOMAN`；
+- 其他性别值和空值映射为 `UNK`。
+- `examage` 的空值映射为 `0.0`。
+
+MySQL 的 DDL 会隐式提交，因此 `UPDATE` 和 `ALTER TABLE` 不能组成一个失败后完整
+回滚的事务。该脚本不直接修改原表，而是创建并填充 `表名__new` 影子表，确认行数
+一致后用一条原子 `RENAME TABLE` 完成切换。迁移失败时原表保持不变；迁移成功后，
+原始数据保留在 `表名__backup`，确认结果后再手工删除备份。
+
+执行命令：
+
+```bash
+mysql \
+  --socket=/DaTa/mysql/mysql.sock \
+  --user=root --password=root \
+  datas_in_progress \
+  < sqls/migrate_lab_item_uid_to_itemname.sql
+```
+
+在 MySQL CLI 中默认迁移 `lab_item_tc`：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/migrate_lab_item_uid_to_itemname.sql;
+```
+
+迁移其他表时先设置表名。例如：
+
+```sql
+SET @target_table = 'lab_item_tc';
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/migrate_lab_item_uid_to_itemname.sql;
+```
+
+如果 `表名__backup` 已存在，脚本会拒绝执行，避免覆盖原始备份。非空但无法转换
+的日期或数值也会中止迁移，原表仍保持不变。
+
+在把 `itemresult` 修改为 `DOUBLE` 前，可先运行只读检查：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/check_itemresult_numeric.sql;
+```
+
+检查其他表时先设置 `@target_table`。结果中的 `non_convertible_rows` 包含 NULL、
+空字符串和非数字文本；只有该值为 0 时，所有 `itemresult` 才能直接转换为
+`DOUBLE NOT NULL`。脚本还会按频次列出最多100种异常值及100条对应记录。
+
+确认 `non_convertible_rows = 0` 后，将 `itemresult` 转为 `DOUBLE NOT NULL`：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/migrate_itemresult_to_double.sql;
+```
+
+该脚本默认修改 `lab_item_tc`，并且只执行一条 `ALTER TABLE`。MySQL 8/InnoDB 会
+原子应用这条 DDL；若某个值超出 DOUBLE 范围等原因导致失败，原字段和值保持不变。
+
+检查 `normallowvalue` 和 `normalhighvalue` 是否能转换为 nullable DOUBLE：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/check_normal_values_numeric.sql;
+```
+
+脚本默认检查 `lab_item_tc`。NULL 对目标 `DOUBLE NULL` 是合法值，不计入
+`non_convertible_rows`；空字符串和非数字文本会计入，并在后续结果中按频次列出。
+
+确认两列的 `non_convertible_rows` 都为 0 后执行转换：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/migrate_normal_values_to_double.sql;
+```
+
+脚本通过同一条 `ALTER TABLE` 把 `normallowvalue` 和 `normalhighvalue` 改为
+`DOUBLE NULL`。两列转换会一起成功；如果任一列转换失败，原字段和值保持不变。
+
+最后把结果单位改为目标 nullable TEXT：
+
+```sql
+SOURCE /DaTa/ljc_codes/ikang-formal-datamining/sqls/migrate_itemindexresultunit_to_text.sql;
+```
+
+该脚本默认把 `lab_item_tc.itemindexresultunit` 修改为 `TEXT NULL`。如果某个值超过
+TEXT 容量，单条原子 DDL 会失败，原字段定义和值保持不变。
 
 ## 测试
 
