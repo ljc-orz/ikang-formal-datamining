@@ -10,10 +10,12 @@ MySQL。三个步骤都按批处理数据，不需要把大型明细文件整体
 ikang-formal-datamining/
 ├── src/
 │   ├── export_items.py
+│   ├── export_split_to_parquet_extra.py
 │   ├── filter_parquets_by_ids.py
 │   └── import_parquet_to_mysql.py
 ├── tests/
 │   ├── test_export_items.py
+│   ├── test_export_split_to_parquet_extra.py
 │   ├── test_filter_parquets_by_ids.py
 │   └── test_import_parquet_to_mysql.py
 ├── sqls/
@@ -73,7 +75,39 @@ conda run --no-capture-output -n ikang python src/filter_parquets_by_ids.py \
 输出文件保持源文件名、schema 和行序。`filter_summary.csv` 包含源行数与保留行数，
 并按照 `retained_rows` 降序排列。
 
-## 3. 导入单个 Parquet 到 MySQL
+## 3. 合并额外指标并导出划分 Parquet
+
+`src/export_split_to_parquet_extra.py` 以
+`datas.result_merged_wide_split_50000` 为主表，通过 `(uid, id)` 内连接
+`datas_in_progress` 中的额外指标表。两个导出程序的非结果字段完全一致，均为
+`uid`、`id`、`hospid`、`usex`、`examage`、两列图像路径以及来自 `datas` 主表的
+`split`。结果字段则不再导出主表原有的 `result_alt` 到 `result_wbc`，只导出
+`--item` 配置的额外结果字段。每张指标表按照含边界的正常范围生成标签：
+`itemresult`、`normallowvalue` 或 `normalhighvalue` 任一为 NULL 时输出 NULL；
+`normallowvalue <= itemresult <= normalhighvalue` 时输出 0（正常），否则输出
+1（异常）。动态结果字段与原始导出程序一致，使用 int8 类型并写在 `split` 之前。
+
+表名和输出字段名通过可重复的 `--item TABLE=OUTPUT_FIELD` 参数配置。导出当前五个
+指标的命令为：
+
+```bash
+conda run --no-capture-output -n ikang python src/export_split_to_parquet_extra.py \
+  --item lab_item_ldl_c=result_ldl_c \
+  --item lab_item_plt=result_plt \
+  --item lab_item_tc=result_tc \
+  --item lab_item_ua=result_ua \
+  --item lab_item_urea=result_urea \
+  --output /DaTa/ljc_codes/ikang-formal/prepare_data/result_merged_wide_split_50000_extra.parquet \
+  --expected-rows 50000 \
+  --batch-size 5000
+```
+
+程序使用服务端游标流式读取并显示 Rich 进度条，按 `uid,id` 排序输出。只有导出行数
+和 Parquet 元数据均通过检查后才会原子替换最终文件；默认拒绝覆盖，重新导出需增加
+`--overwrite`。以后增加或更换指标时只需调整 `--item`，代码中没有硬编码这五个
+字段。
+
+## 4. 导入单个 Parquet 到 MySQL
 
 `src/import_parquet_to_mysql.py` 使用 PyMySQL 连接以下数据库：
 
@@ -127,7 +161,7 @@ list、struct、map 等嵌套类型不会被隐式序列化，遇到时直接报
 导入前应根据实际情况删除该表、使用 `replace`，或确认不会产生重复后再使用
 `append`。
 
-## 4. 调整 `lab_item_alt` 的前半段表结构
+## 5. 调整 `lab_item_alt` 的前半段表结构
 
 `sqls/migrate_lab_item_uid_to_itemname.sql` 将 `uid` 到 `itemname` 修改为目标
 类型，并创建 `(uid, id)` 主键以及 `hospid`、`regdate`、`usex`、
